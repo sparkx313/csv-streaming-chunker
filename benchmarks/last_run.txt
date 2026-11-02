@@ -1,0 +1,91 @@
+csvchunker benchmarks - python 3.11.9
+generated bench.csv: 23.6 MB, 200,000 rows, 4 columns
+
+1. peak allocations, streaming vs holding everything
+----------------------------------------------------
+  the same file read two ways under tracemalloc; chunk_size=500. streaming
+  keeps one chunk plus one 32 KB block alive, read_all keeps every row, so
+  these byte figures are deterministic and reproduce exactly across runs.
+
+       rows   file MB   streaming    read_all   ratio
+      20000       2.3        497K       7904K     16x
+     200000      23.6        506K      79321K    157x
+  the streaming column moves 1.9% across a 10.4x bigger file -- flat, which
+  is the claim; if the generator were secretly buffering, read_all would sit
+  still too. It does not: it scales 10.0x against the file's 10.4x, so the
+  control scales with the input and the streaming column does not.
+
+
+2. throughput against the C-implemented csv module
+--------------------------------------------------
+  rows read : ours 200000, csv 200000 data rows (+1 header)
+  best time : ours 4.498s, csv 0.283s over the 200000 rows
+  rows/s    : ours     44,467   csv      706,046
+  pass-pass noise floor: ours 15%, csv 5%
+  csv is 15.9x faster here (4.498s against 0.283s best-of-5): a Python record
+  assembler that also reports byte offsets cannot beat a C tokenizer, and a
+  1488% gap is 100.4x this run's wider floor (15%), so it is a
+  real ordering and not a load artifact. That 15.9x is the price of offsets;
+  if you only need rows, `csv` is the right tool and this is not it.
+
+
+3. resume cost, last 10% of the 200000 rows
+-------------------------------------------
+  rows after boundary: 20000, read 20000 via resume_at, 20000 via scan
+  resume_at  best-of-5 : 0.456s (43,821 rows/s)
+  scan+discard best     : 4.496s
+  noise floor: resume_at 13%, scan 6%
+  measured speed-up 9.9x for skipping 90% of the rows (ideal from bytes
+  would be 9.8x); correctness first: both paths hand back the same
+  20000 rows, so the seek is not reading less data by accident. The
+  speed-up is 885% of the scan's own time against pass-pass floors
+  of 13% and 6%, so the ordering is far outside noise.
+
+
+4. byte-range partitioning (workers=4)
+--------------------------------------
+  plan       : 4 windows, reason=line-boundary split
+  boundaries : [0, 5888992, 11777832, 17666712] ... ends at file size=True
+  contiguous : True (no gap, no overlap)
+    window         0-  5888992:   51150 rows
+    window   5888992- 11777832:   50702 rows
+    window  11777832- 17666712:   49074 rows
+    window  17666712- 23555592:   49074 rows
+  split vs whole: 200000 rows vs 200000, equal=True
+  cuts fall at byte one-quarters, so window (0, 5888992)
+  rows spread 49074..51150 are unequal by design; the invariant that
+  matters is equal=True: sharded reads return the same rows in the same order
+  as one sequential read. Nothing here claims a parallel speed-up - the
+  iterator walks windows in file order so the comparison is exact; the
+  offsets are what make handing each window to its own process safe.
+
+
+5. what the planner's validation pass costs, and what it refuses
+----------------------------------------------------------------
+    no quoted newlines: validate 0.555s -> 4 windows, skip 0.001s -> 4 windows
+    records span lines: validate 0.236s -> 1 windows, skip 0.000s -> 4 windows
+  refused because: records span newlines; line-boundary cuts would split a
+                    record
+  validate=True on the flat file: 4 windows (line-boundary split)
+  the flat file costs a full extra pass to validate and still yields 4
+  windows; the quoted file costs the same pass and yields 1 - the scan found
+  records that span newlines and refused a line-boundary cut, because a
+  validated line-boundary plan is only trustworthy once you know no record
+  crosses a line. Skipping validation is available and the note says so.
+
+6. delimiter sniffing through quoted commas
+-------------------------------------------
+  each file quotes some cells as "has,comma", so counting raw commas would
+  rank "," wrong; sniffing keys on field-count consistency instead. seeded
+  (random.Random(3)) - the quoted-cell counts below reproduce exactly.
+
+     ',' headers ['a', 'b', 'c'], 200 rows x 3 fields, 21 quoted cells intact
+     ';' headers ['a', 'b', 'c'], 200 rows x 3 fields, 21 quoted cells intact
+    '\t' headers ['a', 'b', 'c'], 200 rows x 3 fields, 19 quoted cells intact
+     '|' headers ['a', 'b', 'c'], 200 rows x 3 fields, 26 quoted cells intact
+  all four report the right 3-column header and the comma cell survives the
+  quoted parse, so the delimiter is chosen by consistency, not by which
+  character appears most often.
+
+
+end of run - all numbers above belong to this run only

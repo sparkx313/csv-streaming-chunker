@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "csv-streaming-chunker"
+version = "0.1.0"
+description = "Dependency-free resumable CSV chunk reading: byte-offset chunk boundaries that respect quoted newlines and delimiter runs, so parallel slices reproduce exactly the rows of one sequential read, plus a reproducible benchmark"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.setuptools]
+packages = ["csvchunker"]

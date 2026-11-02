@@ -8,17 +8,30 @@ No dependencies. Standard library only, Python 3.9+ (measured on CPython 3.11.9,
 Windows x64).
 
 ```python
-from csvchunker import ChunkedCsvReader, plan_ranges
+import os, tempfile
+from csvchunker import ChunkedCsvReader, plan_ranges, iter_range_chunks
 
-reader = ChunkedCsvReader("orders.csv", chunk_size=5000)
-for chunk in reader.chunks():
-    process(chunk.rows)
-    checkpoint = chunk.byte_end          # store this
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+with open(path, "w", newline="", encoding="utf-8") as handle:
+    handle.write("order_id,amount\n")
+    for i in range(1, 2001):
+        handle.write("%d,%d\n" % (i, i * 7 % 10000))
 
-# next run, or next worker
-ChunkedCsvReader("orders.csv", chunk_size=5000).chunks(resume_at=checkpoint)
+checkpoints = [c.byte_end for c in ChunkedCsvReader(path, chunk_size=500).chunks()]
+print(checkpoints)                    # [4251, 8752, 13665, 18594] - last is the file size
 
-ranges, notes = plan_ranges("orders.csv", workers=4)   # [(0, 5888992), ...]
+tail = list(ChunkedCsvReader(path, chunk_size=500).chunks(resume_at=checkpoints[1]))
+print(len(tail), sum(len(c) for c in tail), tail[0].first_row)      # 2 1000 0
+
+ranges, notes = plan_ranges(path, workers=4)
+print(ranges)                         # [(0, 4656), (4656, 9302), (9302, 13953), (13953, 18594)]
+print(notes["reason"], notes["validated"])   # line-boundary split True
+
+window = ranges[2]
+rows = list(iter_range_chunks(path, window[0], window[1], chunk_size=500))
+print(window, sum(len(c) for c in rows), rows[0].rows[0])           # (9302, 13953) 477 ['1056', '7392']
+print(sum(sum(len(c) for c in iter_range_chunks(path, s, e, chunk_size=500))
+          for s, e in ranges))        # 2000 - the four windows are the whole file
 ```
 
 A `Chunk` is `(rows, first_row, byte_start, byte_end)`. The byte window is the point
@@ -36,15 +49,16 @@ newline anywhere in the file turns "the next terminator" into a position *inside
 record. So `plan_ranges` validates first — a full pass counting multi-line records —
 and **refuses to shard** a file where the cuts would corrupt data:
 
-```
-    no quoted newlines: validate 1.286s -> 4 windows, skip validation 0.001s -> 4 windows
-    records span lines: validate 0.717s -> 1 windows, skip validation 0.001s -> 4 windows
-  refused because: records span newlines; line-boundary cuts would split a record
+```text
+    no quoted newlines: validate 0.555s -> 4 windows, skip 0.001s -> 4 windows
+    records span lines: validate 0.236s -> 1 windows, skip 0.000s -> 4 windows
+  refused because: records span newlines; line-boundary cuts would split a
+                    record
 ```
 
 `validate=False` is available when the caller already knows the file is one record per
 line, and the note says so. The safe default costs a full pass; the number above is
-that price, and it is honest about being O(file).
+that price on a 23.6 MB file, and it is honest about being O(file).
 
 **3. Byte offsets must survive decoding.** Universal newlines are handled explicitly
 (`\r\n`, `\n`, bare `\r`) instead of asking Python to translate them, because
@@ -67,10 +81,10 @@ generated 23.6 MB / 200,000-row / 4-column file.
 
 `tracemalloc`, Python-side allocations only:
 
-```
-     rows  file (MB)    streaming     read_all    ratio
-    20000        2.3        497K       7904K      16x
-   200000       23.6        506K      79321K     157x
+```text
+       rows   file MB   streaming    read_all   ratio
+      20000       2.3        497K       7904K     16x
+     200000      23.6        506K      79321K    157x
 ```
 
 The streaming column is the claim: **497K → 506K for 10× the file**, i.e. flat, because
@@ -84,37 +98,48 @@ columns would scale together.
 Reading the last 10% of a 23.6 MB file two ways: seek to the checkpoint, or scan from
 the top and throw rows away.
 
-```
+```text
   rows after boundary: 20000, read 20000 via resume_at, 20000 via scan
-  resume_at          : 0.540s (37,015 rows/s)
-  scan and discard   : 5.266s
-  speed-up           : 9.7x
+  resume_at  best-of-5 : 0.456s (43,821 rows/s)
+  scan+discard best     : 4.496s
+  noise floor: resume_at 13%, scan 6%
+  measured speed-up 9.9x for skipping 90% of the rows (ideal from bytes
+  would be 9.8x); correctness first: both paths hand back the same
+  20000 rows, so the seek is not reading less data by accident. The
+  speed-up is 885% of the scan's own time against pass-pass floors
+  of 13% and 6%, so the ordering is far outside noise.
 ```
 
-9.7× for skipping 90% of the work — the speed-up tracks the fraction skipped, not the
-file size, which is the property that makes it usable on a 40 GB file. Both paths return
-the identical 20,000 rows, which is the correctness half of the sentence.
+9.9× for skipping 90% of the work, against the 9.8× the byte ratio alone predicts.
+The seek side's own pass-to-pass floor on this run is 13%, so the measured and the
+predicted speed-ups are not distinguishable — the seek does the work the byte
+arithmetic says it must, and no more. The speed-up tracks the fraction skipped rather
+than the file size, which
+is the property that makes it usable on a 40 GB file. Both paths return the identical
+20,000 rows, which is the correctness half of the sentence.
 
 ### Throughput against `csv`
 
-```
-  rows read        : ours 200000, csv 200000
-  time             : ours 5.942s, csv 0.337s
-  rows/s           : ours     33,656   csv    593,278
-  csv is 17.6x faster (C tokenizer vs Python)
+```text
+  rows read : ours 200000, csv 200000 data rows (+1 header)
+  best time : ours 4.498s, csv 0.283s over the 200000 rows
+  rows/s    : ours     44,467   csv      706,046
+  pass-pass noise floor: ours 15%, csv 5%
 ```
 
 Python's `csv` module is a C extension. This is pure Python doing quote-parity record
-assembly and byte accounting on every line, so it is 17.6× slower per row and that is
-the cost of the three features above. If you just need rows, use `csv`. If you need
+assembly and byte accounting on every line, so it is 15.9× slower per row and that is
+the cost of the three features above — our own column's pass-to-pass floor on this run
+is 15%, so a 1488% gap is not something the load moved. If you just need rows, use
+`csv`. If you need
 resumable, sharded, offset-exact reads of a file that does not fit in memory, `csv`
 cannot do it.
 
 ### Byte-range partitioning
 
-```
-  plan       : 4 windows, line-boundary split
-  boundaries : [0, 5888992, 11777832, 17666712] ... True
+```text
+  plan       : 4 windows, reason=line-boundary split
+  boundaries : [0, 5888992, 11777832, 17666712] ... ends at file size=True
   contiguous : True (no gap, no overlap)
     window         0-  5888992:   51150 rows
     window   5888992- 11777832:   50702 rows
@@ -136,11 +161,11 @@ window to a process is the intended use, and the offsets are what make it safe.
 Quote-aware, by field-count consistency across the first lines. Each file below contains
 quoted `has,comma` values, so a naive counter gets the `,` case wrong:
 
-```
-    ',': headers ['a', 'b', 'c'], 200 rows, 3 fields each, 21 quoted 'has,comma' values survived intact
-    ';': headers ['a', 'b', 'c'], 200 rows, 3 fields each, 21 quoted 'has,comma' values survived intact
-   '\t': headers ['a', 'b', 'c'], 200 rows, 3 fields each, 19 quoted 'has,comma' values survived intact
-    '|': headers ['a', 'b', 'c'], 200 rows, 3 fields each, 26 quoted 'has,comma' values survived intact
+```text
+     ',' headers ['a', 'b', 'c'], 200 rows x 3 fields, 21 quoted cells intact
+     ';' headers ['a', 'b', 'c'], 200 rows x 3 fields, 21 quoted cells intact
+    '\t' headers ['a', 'b', 'c'], 200 rows x 3 fields, 19 quoted cells intact
+     '|' headers ['a', 'b', 'c'], 200 rows x 3 fields, 26 quoted cells intact
 ```
 
 ## Two deliberate differences from `csv`
